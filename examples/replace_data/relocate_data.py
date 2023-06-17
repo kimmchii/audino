@@ -1,7 +1,8 @@
 import mysql.connector
 from dataclasses import dataclass
-from typing import NamedTuple, List, Tuple, Dict
-from enum import Enum, auto 
+from typing import List, Tuple, Dict
+from enum import Enum
+import argparse
 
 class UserColumn(Enum):
   TABLE_NAME = "user"
@@ -100,8 +101,9 @@ def get_ids_and_username(
   
 def get_transcripts_status(
     mysql_connection: mysql.connector.connection,
-    table_name: Enum, 
-    column_lists: List[Enum], 
+    table_name: Enum = SegmentColumn.TABLE_NAME, 
+    column_lists: List[Enum] = [
+      SegmentColumn.DATA_ID, SegmentColumn.TRANSCRIPTION], 
   ) -> Dict[str, List[int | bool]]:
   """
   Returns the status of an annotated transcript. If the transcript is found but empty, set its status, 
@@ -127,9 +129,14 @@ def get_transcripts_status(
 
 def get_audios_attributes(
     mysql_connection: mysql.connector.connection,
-    table_name: Enum, 
-    column_lists: List[Enum], 
     id_transcript_dict: Dict[str, List[int | bool]],
+    table_name: Enum = DataColumn.TABLE_NAME, 
+    column_lists: List[Enum] = [
+      DataColumn.ID, 
+      DataColumn.PROJECT_ID, 
+      DataColumn.ASSINGED_USER_ID, 
+      DataColumn.IS_MARKED_FOR_REVIEW
+    ],
   ) : # TODO define the return type 
   """
   Returns the audios's attribute which consists of audio_id, project_id, assigned_user, 
@@ -154,7 +161,8 @@ def get_audios_attributes(
 
   for i, id_value in enumerate(id_transcript_dict["id"]):
     # Shifts an index b.c. sql starts with 1, chang the value from True to False if the audio contain a transcript.
-    # BUG could happen at `id_value`, better safty is needed
+    # BUG TODO could happen at `id_value` if the `id_value` skips like from id 1 -> 3 -> 4 instead of 1 -> 2 -> 3 -> 4, 
+    # BUG TODO this bug could happen if we have deleted the username before, better safty is NEEDED
     audio_attributes_list[id_value-1].is_empty_transcript = id_transcript_dict["is_empty_transcript"][i]
 
   return audio_attributes_list
@@ -183,42 +191,63 @@ def construct_attributes_by_user_dict(
   return user_attributes_dict
 
 
-def relocate_files_from_users(
+
+def relocate_audios_from_users(
     mysql_connection: mysql.connector.connection,
     user_attributes_dict: Dict[str, List[Dict[str, int | bool]]],
-    from_username: List[str],
+    from_usernames: List[str],
     target_username: str,
-    table_name: Enum, 
-    column_name: Enum, 
-    id_user_conversion_dict: Dict[str, str]
+    numbers_of_transfer_audios: int,
+    id_user_conversion_dict: Dict[str, str],
+    table_name: Enum = DataColumn.TABLE_NAME, 
+    column_name: Enum = DataColumn.ASSINGED_USER_ID, 
   ) -> None:
-  """"""
+  """
+  Relocates the audio files from defined usernames to the target username by updating their `assigned_user_id` in the table. 
+  """
   # List the audio ids that we're going to relocate based on `from_user`.
-  moved_audio_ids = []
-  for user_id in from_username:
-    for attributes in user_attributes_dict[user_id]:
-        if not(attributes["is_marked_for_review"] and attributes["is_empty_transcript"]):
-            moved_audio_ids.append(attributes["audio_id"])
   
+  total_movable_audio_ids = []
+  for username in from_usernames:
+    assert username in user_attributes_dict.keys(), \
+      f"Username: {username} has no data in the table: {table_name}, The possible causes are the wrong username or the username does not possess any audio"
+    for attributes in user_attributes_dict[username]:
+        if not(attributes["is_marked_for_review"] and attributes["is_empty_transcript"]):
+            total_movable_audio_ids.append(attributes["audio_id"])
+  
+  assert numbers_of_transfer_audios <= len(total_movable_audio_ids), \
+    f"The actual number of audios in user: {from_usernames} is {len(total_movable_audio_ids)} but you want to move {numbers_of_transfer_audios} audios whcih is not enough. Please change the value..."
+
   # Connect a cursor to mysql database.
   cursor = mysql_connection.cursor(buffered=True)
   
   # TODO Optimize to below part
+  # Update the assigned_user_id in the data table based on target id. 
   for id, username in id_user_conversion_dict.items():
       if username == target_username:
-        for audio_id in moved_audio_ids:
-            query = f"UPDATE {table_name} SET {column_name} = {id} WHERE id = {audio_id}"
+        for audio_id in total_movable_audio_ids[: numbers_of_transfer_audios]:
+            query = f"UPDATE {table_name.value} SET {column_name.value} = {id} WHERE id = {audio_id}"
             cursor.execute(query)
             mysql_connection.commit()
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--host", type=str, help="IP address of the hostname")
+parser.add_argument("-u", "--user", type=str, help="user for accessing to the database")
+parser.add_argument("-p", "--password", type=str, help="password for accessing to the database")
+parser.add_argument("-d", "--database", type=str, help="database's name")
+parser.add_argument("--port", default=3306, type=int, help="port used fordeplyoyed the dabase, the default one is 3306")
+parser.add_argument("-i", "--move_from_username", nargs="+", help= "list of the users that we are going to move the audios to the target user")
+parser.add_argument("-j", "--target_username", type=str, help="target username as the destination of transfered files")
+parser.add_argument("-k", "--numbers_of_transfer_audios", type=int, help="the numbers of audio files that we are going to transfer")
 
 if __name__ == "__main__":
+  args = parser.parse_args()
   connector_obj = ConnectorObject(
-    host="172.18.0.2",
-    user="audino",
-    password="audino",
-    database="audino",
-    port=3306,
+    host = args.host,
+    user = args.user,
+    password = args.password,
+    database = args.database,
+    port = 3306,
   )
   mysql_connection = connect_mysql(connector_obj)
 
@@ -247,12 +276,14 @@ if __name__ == "__main__":
   user_attributes_dict = construct_attributes_by_user_dict(
                            audio_attributes_list = audio_attribute_list, 
                          )
-  
-  relocate_files_from_users(
+
+  relocate_audios_from_users(
     mysql_connection = mysql_connection,
     user_attributes_dict = user_attributes_dict,
-    from_username = [],
-    target_username = s, 
+    from_usernames = args.move_from_username,
+    target_username = args.target_username, 
+    numbers_of_transfer_audios = args.numbers_of_transfer_audios,
     table_name = DataColumn.TABLE_NAME,
+    column_name= DataColumn.ASSINGED_USER_ID,
     id_user_conversion_dict = id_user_conversion_dict,
   )
